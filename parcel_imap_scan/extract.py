@@ -18,20 +18,26 @@ TRACKING_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("USPS", re.compile(r"\b(?:92|93|94|95)[0-9]{18,20}\b")),
     ("AliExpress / Cainiao", re.compile(r"\b(?:LP|LX|RR|RB|RC)[0-9]{9}CN\b", re.IGNORECASE)),
     ("DHL", re.compile(r"\b[0-9]{10,11}\b")),
-    ("FedEx", re.compile(r"\b(?:96|61|62)[0-9]{10,13}\b")),
+    # FedEx numbers aren't limited to a 96/61/62 prefix (e.g. door-tag/Express
+    # numbers like 879560352732) -- any 12, 15, or 20-22 digit run, gated by
+    # sender/subject since that range alone is too generic to trust blind.
+    ("FedEx", re.compile(r"\b(?:[0-9]{12}|[0-9]{15}|[0-9]{20,22})\b")),
     ("DPD", re.compile(r"\b[0-9]{14}\b")),
-    ("Evri / Hermes", re.compile(r"\bH[0-9]{16,20}\b", re.IGNORECASE)),
+    # Evri (formerly Hermes) numbers mix letters and digits after the leading
+    # H (e.g. H06R4A0243030310) -- a digits-only pattern missed these.
+    ("Evri / Hermes", re.compile(r"\bH[0-9A-Z]{14,19}\b", re.IGNORECASE)),
     ("Yodel", re.compile(r"\b[0-9]{16}\b")),
 ]
 
 # Patterns broad enough to collide with invoice numbers, phone numbers, etc.
 # Only counted as a match when the sender or subject also mentions the carrier.
-SENDER_GATED = {"DHL", "FedEx", "DPD", "Yodel"}
+SENDER_GATED = {"DHL", "FedEx", "DPD", "Yodel", "Evri / Hermes"}
 SENDER_KEYWORDS: dict[str, list[str]] = {
     "DHL": ["dhl"],
     "FedEx": ["fedex"],
     "DPD": ["dpd"],
     "Yodel": ["yodel"],
+    "Evri / Hermes": ["evri", "hermes"],
 }
 
 
