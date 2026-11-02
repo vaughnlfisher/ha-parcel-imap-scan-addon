@@ -324,15 +324,42 @@ async def idle_watch_loop() -> None:
 # HTTP trigger endpoint for on-demand backfill
 # ---------------------------------------------------------------------------
 
+_scan_status = {"state": "idle", "days_back": None, "result": None}
+
+
+async def _run_backfill_background(days_back: int) -> None:
+    _scan_status.update(state="running", days_back=days_back, result=None)
+    loop = asyncio.get_event_loop()
+    try:
+        result = await loop.run_in_executor(None, run_backfill_scan, days_back)
+        _scan_status.update(state="done", result=result)
+    except Exception:  # noqa: BLE001
+        log.exception("Backfill scan failed")
+        _scan_status.update(state="error", result=None)
+
+
 async def handle_scan(request: web.Request) -> web.Response:
+    """Kick off a backfill scan in the background and return immediately.
+
+    A full mailbox scan can take tens of minutes; this used to block the HTTP
+    response for that whole time, which meant the scan died if the client
+    (or its connection) went away before it finished. Now it just starts a
+    background task and the caller polls /scan (GET) or the todo list for
+    progress.
+    """
+    if _scan_status["state"] == "running":
+        return web.json_response({"status": "already_running", **_scan_status}, status=409)
     try:
         body = await request.json()
     except Exception:  # noqa: BLE001
         body = {}
     days_back = int(body.get("days_back", DAYS_BACK_DEFAULT))
-    loop = asyncio.get_event_loop()
-    result = await loop.run_in_executor(None, run_backfill_scan, days_back)
-    return web.json_response(result)
+    asyncio.create_task(_run_backfill_background(days_back))
+    return web.json_response({"status": "started", "days_back": days_back})
+
+
+async def handle_scan_status(request: web.Request) -> web.Response:
+    return web.json_response(_scan_status)
 
 
 async def handle_health(request: web.Request) -> web.Response:
@@ -341,7 +368,13 @@ async def handle_health(request: web.Request) -> web.Response:
 
 async def main() -> None:
     app = web.Application()
-    app.add_routes([web.post("/scan", handle_scan), web.get("/health", handle_health)])
+    app.add_routes(
+        [
+            web.post("/scan", handle_scan),
+            web.get("/scan", handle_scan_status),
+            web.get("/health", handle_health),
+        ]
+    )
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", 8099)
