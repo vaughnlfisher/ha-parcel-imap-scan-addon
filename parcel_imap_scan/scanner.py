@@ -12,9 +12,14 @@ Two modes, both enabled by default:
     of mail (for catching up on a gap, or re-running after a pattern tweak).
 
 Found tracking numbers are reported into Home Assistant's own to-do list via
-the HA REST API, authenticated with a long-lived access token the user
-generates and pastes into the add-on's own configuration (never entered by
-Claude).
+the HA Core REST API proxy at http://supervisor/core/api, authenticated with
+the SUPERVISOR_TOKEN Supervisor automatically injects into every add-on
+container (once homeassistant_api: true is set in config.yaml) -- NOT a
+manually-created long-lived access token. (An earlier version of this add-on
+required the user to paste in their own long-lived token, which never worked
+against the supervisor/core proxy: that endpoint only accepts the add-on's
+own Supervisor-issued token. The ha_token option is kept only as an optional
+override/fallback for running this script outside of Supervisor.)
 """
 from __future__ import annotations
 
@@ -23,6 +28,7 @@ import email
 import imaplib
 import json
 import logging
+import os
 import re
 from datetime import datetime, timedelta
 from email.header import decode_header
@@ -62,7 +68,15 @@ IMAP_SERVER = OPTIONS.get("imap_server", "imap.gmail.com")
 IMAP_PORT = int(OPTIONS.get("imap_port", 993))
 IMAP_FOLDER = OPTIONS.get("imap_folder", "INBOX")
 HA_URL = str(OPTIONS.get("ha_url", "http://supervisor/core")).rstrip("/")
-HA_TOKEN = OPTIONS["ha_token"]
+# Prefer the Supervisor-injected token (this is what http://supervisor/core
+# actually authenticates against); fall back to a manually-configured token
+# only if SUPERVISOR_TOKEN isn't present (e.g. running outside Supervisor).
+HA_TOKEN = os.environ.get("SUPERVISOR_TOKEN") or OPTIONS.get("ha_token", "")
+if not HA_TOKEN:
+    log.warning(
+        "No SUPERVISOR_TOKEN in the environment and no ha_token option set; "
+        "calls to Home Assistant will fail with 401."
+    )
 TODO_ENTITY = OPTIONS.get("todo_entity", "todo.parcels")
 DAYS_BACK_DEFAULT = int(OPTIONS.get("days_back_default", 90))
 IDLE_ENABLED = bool(OPTIONS.get("idle_enabled", True))

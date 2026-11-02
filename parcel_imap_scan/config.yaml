@@ -1,5 +1,5 @@
 name: "Parcel IMAP Scan"
-version: "1.0.3"
+version: "1.0.4"
 slug: "parcel_imap_scan"
 description: "Watches a mailbox (live IMAP IDLE + on-demand backfill) for parcel tracking numbers and reports them into Home Assistant via the REST API."
 url: "https://github.com/vaughnlfisher/ha-parcel-imap-scan-addon"
@@ -11,6 +11,7 @@ startup: application
 boot: auto
 init: false
 ingress: false
+homeassistant_api: true
 ports:
   8099/tcp: 8099
 ports_description:
@@ -24,6 +25,9 @@ options:
   ha_url: "http://supervisor/core"
   ha_token: ""
   todo_entity: "todo.parcels"
+  # ha_token is now an optional fallback only -- the add-on authenticates to
+  # http://supervisor/core using its own Supervisor-injected SUPERVISOR_TOKEN
+  # (via homeassistant_api: true above), not this value. Leave it blank.
   days_back_default: 90
   idle_enabled: true
   log_level: "info"
@@ -34,7 +38,7 @@ schema:
   imap_port: "port"
   imap_folder: "str"
   ha_url: "url"
-  ha_token: "password"
+  ha_token: "password?"
   todo_entity: "str"
   days_back_default: "int(1,3650)"
   idle_enabled: "bool"
