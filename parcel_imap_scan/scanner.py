@@ -51,6 +51,11 @@ logging.basicConfig(
 )
 log = logging.getLogger("parcel_imap_scan")
 
+# aioimaplib logs every raw IMAP line (including full message bodies) at
+# DEBUG, which floods the add-on's log and buries our own messages. Keep it
+# at WARNING regardless of our own log_level setting.
+logging.getLogger("aioimaplib.aioimaplib").setLevel(logging.WARNING)
+
 IMAP_EMAIL = OPTIONS["imap_email"]
 IMAP_PASSWORD = OPTIONS["imap_password"]
 IMAP_SERVER = OPTIONS.get("imap_server", "imap.gmail.com")
