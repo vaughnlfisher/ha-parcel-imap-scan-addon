@@ -226,10 +226,18 @@ def process_matches(parsed: dict) -> int:
 # On-demand backfill scan (blocking, run in an executor thread)
 # ---------------------------------------------------------------------------
 
+IMAP_SOCKET_TIMEOUT = 60  # seconds; imaplib has no default and will hang forever
+FETCH_CHUNK_SIZE = 100  # messages per IMAP round-trip
+
+
 def run_backfill_scan(days_back: int) -> dict:
     found = 0
     added = 0
-    conn = imaplib.IMAP4_SSL(IMAP_SERVER, IMAP_PORT)
+    processed = 0
+    # Without an explicit timeout, imaplib will block forever on a stalled or
+    # throttled connection -- a single hung FETCH used to silently kill the
+    # whole backfill with no error logged at all.
+    conn = imaplib.IMAP4_SSL(IMAP_SERVER, IMAP_PORT, timeout=IMAP_SOCKET_TIMEOUT)
     try:
         conn.login(IMAP_EMAIL, IMAP_PASSWORD)
         conn.select(IMAP_FOLDER)
@@ -238,20 +246,32 @@ def run_backfill_scan(days_back: int) -> dict:
         if status != "OK" or not data or not data[0]:
             log.warning("Backfill scan: search returned no messages (status=%s)", status)
             return {"found": 0, "added": 0}
-        uids = data[0].split()
-        log.info("Backfill scan: scanning %d messages since %s", len(uids), since)
-        for uid in uids:
-            status, msg_data = conn.fetch(uid, "(RFC822)")
-            if status != "OK" or not msg_data or msg_data[0] is None:
+        uids = [u.decode() if isinstance(u, bytes) else u for u in data[0].split()]
+        total = len(uids)
+        log.info("Backfill scan: scanning %d messages since %s", total, since)
+        # Fetch in batches (one IMAP round-trip per chunk, not per message) --
+        # with ~12k messages, one-at-a-time fetching was the main reason a
+        # scan could take hours; batching cuts round-trips by ~100x.
+        for start in range(0, total, FETCH_CHUNK_SIZE):
+            chunk = uids[start : start + FETCH_CHUNK_SIZE]
+            status, msg_data = conn.fetch(",".join(chunk), "(RFC822)")
+            if status != "OK" or not msg_data:
+                processed += len(chunk)
                 continue
-            raw = msg_data[0][1]
-            if not isinstance(raw, (bytes, bytearray)):
-                continue
-            parsed = _parse_message(raw)
-            matches = extract_tracking(parsed["subject"], parsed["sender"], parsed["body"])
-            found += len(matches)
-            if matches:
-                added += process_matches(parsed)
+            for item in msg_data:
+                if not (isinstance(item, tuple) and len(item) >= 2):
+                    continue
+                raw = item[1]
+                if not isinstance(raw, (bytes, bytearray)):
+                    continue
+                parsed = _parse_message(raw)
+                matches = extract_tracking(parsed["subject"], parsed["sender"], parsed["body"])
+                found += len(matches)
+                if matches:
+                    added += process_matches(parsed)
+            processed += len(chunk)
+            log.info("Backfill scan: %d/%d messages processed (found %d, added %d so far)",
+                      processed, total, found, added)
     finally:
         try:
             conn.logout()
