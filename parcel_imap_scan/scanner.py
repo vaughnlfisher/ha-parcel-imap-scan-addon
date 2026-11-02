@@ -247,7 +247,11 @@ def run_backfill_scan(days_back: int) -> dict:
 # ---------------------------------------------------------------------------
 
 async def _get_highest_uid(client: "aioimaplib.IMAP4_SSL") -> int:
-    res = await client.uid("search", "ALL")
+    # aioimaplib's uid() wrapper only supports FETCH/STORE/COPY/MOVE/EXPUNGE;
+    # UID SEARCH has its own dedicated method. charset=None avoids a
+    # "CHARSET utf-8" prefix some IMAP servers are picky about for plain
+    # criteria like "ALL".
+    res = await client.uid_search("ALL", charset=None)
     if res.result != "OK" or not res.lines or not res.lines[0]:
         return 0
     uids = res.lines[0].split()
@@ -255,7 +259,7 @@ async def _get_highest_uid(client: "aioimaplib.IMAP4_SSL") -> int:
 
 
 async def _fetch_and_process_new(client: "aioimaplib.IMAP4_SSL", last_uid: int) -> int:
-    res = await client.uid("search", f"UID {last_uid + 1}:*")
+    res = await client.uid_search(f"UID {last_uid + 1}:*", charset=None)
     if res.result != "OK" or not res.lines or not res.lines[0]:
         return last_uid
     uids = sorted({int(u) for u in res.lines[0].split() if int(u) > last_uid})
