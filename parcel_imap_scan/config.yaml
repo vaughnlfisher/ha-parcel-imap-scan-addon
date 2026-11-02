@@ -1,0 +1,41 @@
+name: "Parcel IMAP Scan"
+version: "1.0.0"
+slug: "parcel_imap_scan"
+description: "Watches a mailbox (live IMAP IDLE + on-demand backfill) for parcel tracking numbers and reports them into Home Assistant via the REST API."
+url: "https://github.com/vaughnlfisher/ha-parcel-imap-scan-addon"
+arch:
+  - amd64
+  - aarch64
+  - armv7
+startup: application
+boot: auto
+init: false
+ingress: false
+ports:
+  8099/tcp: 8099
+ports_description:
+  8099/tcp: "HTTP endpoint: POST /scan {\"days_back\": 90} to trigger an on-demand backfill scan"
+options:
+  imap_email: ""
+  imap_password: ""
+  imap_server: "imap.gmail.com"
+  imap_port: 993
+  imap_folder: "INBOX"
+  ha_url: "http://supervisor/core"
+  ha_token: ""
+  todo_entity: "todo.parcels"
+  days_back_default: 90
+  idle_enabled: true
+  log_level: "info"
+schema:
+  imap_email: "email"
+  imap_password: "password"
+  imap_server: "str"
+  imap_port: "port"
+  imap_folder: "str"
+  ha_url: "url"
+  ha_token: "password"
+  todo_entity: "str"
+  days_back_default: "int(1,3650)"
+  idle_enabled: "bool"
+  log_level: "list(debug|info|warning|error)"
