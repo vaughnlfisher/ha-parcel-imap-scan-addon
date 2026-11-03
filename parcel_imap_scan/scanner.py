@@ -113,11 +113,24 @@ SUPERVISOR_HEADERS = {
 
 
 def ha_set_own_options(update: dict) -> None:
+    """Persist a partial options change. The Supervisor's self-options
+    endpoint validates/replaces the WHOLE options object against the
+    add-on's schema, not a merge -- so this fetches the current full
+    options set first and POSTs the merged result, rather than just the
+    changed keys (which previously 400'd for missing required fields)."""
     try:
+        info_resp = requests.get(
+            f"{SUPERVISOR_URL}/addons/self/info",
+            headers=SUPERVISOR_HEADERS,
+            timeout=15,
+        )
+        info_resp.raise_for_status()
+        current = info_resp.json().get("data", {}).get("options", {})
+        merged = {**current, **update}
         resp = requests.post(
             f"{SUPERVISOR_URL}/addons/self/options",
             headers=SUPERVISOR_HEADERS,
-            json={"options": update},
+            json={"options": merged},
             timeout=15,
         )
         resp.raise_for_status()
