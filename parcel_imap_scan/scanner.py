@@ -835,7 +835,12 @@ async def idle_watch_loop() -> None:
     backoff = 5
     while True:
         try:
-            client = aioimaplib.IMAP4_SSL(host=IMAP_SERVER, port=IMAP_PORT)
+            # aioimaplib defaults every command (SELECT, SEARCH, FETCH, ...) to a
+            # 10s timeout, which Gmail's IMAP server occasionally exceeds on this
+            # mailbox (12k+ messages) -- that was the repeating "IDLE watch loop
+            # error" reconnect cycle seen in the logs, not a real connection
+            # failure each time. 30s gives it enough slack.
+            client = aioimaplib.IMAP4_SSL(host=IMAP_SERVER, port=IMAP_PORT, timeout=30.0)
             await client.wait_hello_from_server()
             await client.login(IMAP_EMAIL, IMAP_PASSWORD)
             await client.select(IMAP_FOLDER)
