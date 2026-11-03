@@ -42,6 +42,8 @@ from aiohttp import web
 from extract import extract_tracking
 from amazon_orders import extract_order_status
 from royal_mail import get_summary as rm_get_summary
+import ebay
+import time
 
 OPTIONS_PATH = Path("/data/options.json")
 
@@ -86,10 +88,42 @@ ROYAL_MAIL_CLIENT_ID = OPTIONS.get("royal_mail_client_id", "")
 ROYAL_MAIL_CLIENT_SECRET = OPTIONS.get("royal_mail_client_secret", "")
 ROYAL_MAIL_POLL_SECONDS = 1800  # 30 min; Royal Mail scans aren't second-by-second anyway
 
+EBAY_APP_ID = OPTIONS.get("ebay_app_id", "")
+EBAY_DEV_ID = OPTIONS.get("ebay_dev_id", "")
+EBAY_CERT_ID = OPTIONS.get("ebay_cert_id", "")
+EBAY_RU_NAME = OPTIONS.get("ebay_ru_name", "")
+EBAY_AUTH_CODE = OPTIONS.get("ebay_auth_code", "")
+EBAY_REFRESH_TOKEN = OPTIONS.get("ebay_refresh_token", "")
+EBAY_POLL_SECONDS = 1800  # 30 min; same cadence as the Royal Mail poll
+
 HA_HEADERS = {
     "Authorization": f"Bearer {HA_TOKEN}",
     "Content-Type": "application/json",
 }
+
+# Supervisor's own management API (distinct from the Core API proxied at
+# HA_URL) -- used only so this add-on can persist the eBay refresh token it
+# obtains at startup back into its own options, the same SUPERVISOR_TOKEN
+# already authenticates here with no extra add-on permissions needed.
+SUPERVISOR_URL = "http://supervisor"
+SUPERVISOR_HEADERS = {
+    "Authorization": f"Bearer {HA_TOKEN}",
+    "Content-Type": "application/json",
+}
+
+
+def ha_set_own_options(update: dict) -> None:
+    try:
+        resp = requests.post(
+            f"{SUPERVISOR_URL}/addons/self/options",
+            headers=SUPERVISOR_HEADERS,
+            json={"options": update},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        log.info("Persisted add-on options: %s", list(update.keys()))
+    except Exception:  # noqa: BLE001
+        log.exception("Failed to persist add-on options %s", list(update.keys()))
 
 
 # ---------------------------------------------------------------------------
@@ -366,6 +400,183 @@ async def royal_mail_poll_loop() -> None:
 async def _sleep_forever() -> None:
     while True:
         await asyncio.sleep(3600)
+
+
+# ---------------------------------------------------------------------------
+# eBay live order/tracking status (polling, via the Trading API's GetOrders
+# call authorized with an OAuth user token -- see ebay.py for why GetOrders
+# and not eBay's newer seller-only Fulfillment API). Orders whose carrier
+# matches one of the ha-parcel-integrations carriers already wired in above
+# get handed to that carrier's own live tracker (ha_add_live_tracking) or,
+# for Royal Mail, into the same todo.parcels prefix the royal_mail_poll_loop
+# above already watches -- so tracking status for those comes from the
+# carrier's own API, not eBay's. Every order also gets (or updates) its own
+# "eBay: <order id>" todo item so the purchase itself stays visible even
+# before a tracking number exists.
+# ---------------------------------------------------------------------------
+
+EBAY_PREFIX = "eBay: "
+EBAY_CARRIER_ALIASES: dict[str, str] = {
+    "UPS": "UPS",
+    "UPS GROUND": "UPS",
+    "EVRI": "Evri / Hermes",
+    "HERMES": "Evri / Hermes",
+    "FEDEX": "FedEx",
+    "ROYAL MAIL": "Royal Mail / Parcelforce",
+    "ROYALMAIL": "Royal Mail / Parcelforce",
+    "PARCELFORCE": "Royal Mail / Parcelforce",
+}
+
+
+def ebay_ensure_tokens() -> None:
+    """One-time: if a fresh ebay_auth_code is sitting in options and we
+    don't yet have a refresh token, exchange it and persist the refresh
+    token into our own options (clearing the one-time code) so this only
+    ever needs to run once per consent, not on every restart."""
+    global EBAY_REFRESH_TOKEN
+    if EBAY_REFRESH_TOKEN:
+        return
+    if not (EBAY_APP_ID and EBAY_CERT_ID and EBAY_RU_NAME and EBAY_AUTH_CODE):
+        return
+    tokens = ebay.exchange_code_for_tokens(EBAY_APP_ID, EBAY_CERT_ID, EBAY_RU_NAME, EBAY_AUTH_CODE)
+    if tokens and tokens.get("refresh_token"):
+        EBAY_REFRESH_TOKEN = tokens["refresh_token"]
+        ha_set_own_options({"ebay_refresh_token": EBAY_REFRESH_TOKEN, "ebay_auth_code": ""})
+        log.info("eBay: exchanged one-time auth code for a refresh token; eBay live tracking is now active")
+    else:
+        log.error(
+            "eBay: failed to exchange ebay_auth_code for tokens -- eBay auth codes expire in "
+            "~5 minutes, so paste a fresh one (from a new consent sign-in) and restart promptly"
+        )
+
+
+def ha_get_ebay_items() -> dict[str, dict]:
+    try:
+        resp = requests.post(
+            f"{HA_URL}/api/services/todo/get_items?return_response",
+            headers=HA_HEADERS,
+            json={"entity_id": TODO_ENTITY, "status": "needs_action"},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        service_response = data.get("service_response", data) if isinstance(data, dict) else {}
+        items = service_response.get(TODO_ENTITY, {}).get("items", [])
+    except Exception:  # noqa: BLE001
+        log.exception("Failed to fetch existing todo items for eBay upsert")
+        return {}
+    result: dict[str, dict] = {}
+    for item in items:
+        summary = item.get("summary", "")
+        if not summary.startswith(EBAY_PREFIX):
+            continue
+        order_id = summary[len(EBAY_PREFIX):].split(" ", 1)[0]
+        result[order_id] = {"uid": item.get("uid")}
+    return result
+
+
+def ha_upsert_ebay_item(order: dict, existing: dict) -> None:
+    order_id = order["order_id"]
+    summary = f"{EBAY_PREFIX}{order_id} — {order['status']}"
+    desc_parts = [f"Item: {order['title']}"] if order.get("title") else []
+    if order.get("tracking_number"):
+        desc_parts.append(f"Carrier: {order.get('carrier') or 'Unknown'} | Tracking: {order['tracking_number']}")
+    desc_parts.append("Found by Parcel IMAP Scan add-on (eBay GetOrders API)")
+    description = " | ".join(desc_parts)
+    existing_item = existing.get(order_id)
+    try:
+        if existing_item:
+            resp = requests.post(
+                f"{HA_URL}/api/services/todo/update_item",
+                headers=HA_HEADERS,
+                json={
+                    "entity_id": TODO_ENTITY,
+                    "item": existing_item["uid"],
+                    "rename": summary,
+                    "description": description,
+                },
+                timeout=15,
+            )
+        else:
+            resp = requests.post(
+                f"{HA_URL}/api/services/todo/add_item",
+                headers=HA_HEADERS,
+                json={"entity_id": TODO_ENTITY, "item": summary, "description": description},
+                timeout=15,
+            )
+        resp.raise_for_status()
+        log.info("eBay %s -> %s", order_id, order["status"])
+    except Exception:  # noqa: BLE001
+        log.exception("Failed to upsert eBay todo item for order %s", order_id)
+
+
+def ha_ensure_royal_mail_placeholder(number: str) -> None:
+    """Make sure a bare 'Royal Mail / Parcelforce: <number>' todo item
+    exists so the existing royal_mail_poll_loop (which scans for that exact
+    prefix) picks this number up on its own and manages status/completion
+    itself, instead of eBay and Royal Mail polling fighting over the same
+    item."""
+    existing = ha_get_existing_summaries()
+    if number in existing:
+        return
+    try:
+        resp = requests.post(
+            f"{HA_URL}/api/services/todo/add_item",
+            headers=HA_HEADERS,
+            json={
+                "entity_id": TODO_ENTITY,
+                "item": f"{ROYAL_MAIL_CARRIER}: {number}",
+                "description": "Found via eBay GetOrders API by Parcel IMAP Scan add-on",
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+    except Exception:  # noqa: BLE001
+        log.exception("Failed to create Royal Mail placeholder item for %s", number)
+
+
+async def ebay_poll_loop() -> None:
+    if not (EBAY_APP_ID and EBAY_CERT_ID and EBAY_RU_NAME):
+        log.info("ebay_app_id/cert_id/ru_name not set; eBay live polling disabled")
+        while True:
+            await asyncio.sleep(3600)
+    loop = asyncio.get_event_loop()
+    token_state: dict = {"access_token": None, "expiry": 0.0}
+    while True:
+        try:
+            if not EBAY_REFRESH_TOKEN:
+                log.info(
+                    "eBay: no refresh token yet -- paste a fresh ebay_auth_code in the add-on's "
+                    "options and restart to complete the one-time consent"
+                )
+            else:
+                now = time.time()
+                if not token_state["access_token"] or now >= token_state["expiry"]:
+                    result = await loop.run_in_executor(
+                        None, ebay.refresh_access_token, EBAY_APP_ID, EBAY_CERT_ID, EBAY_REFRESH_TOKEN
+                    )
+                    if result and result.get("access_token"):
+                        token_state["access_token"] = result["access_token"]
+                        token_state["expiry"] = now + int(result.get("expires_in", 7200)) - 120
+                    else:
+                        log.error("eBay: failed to refresh access token")
+                        token_state["access_token"] = None
+                if token_state["access_token"]:
+                    orders = await loop.run_in_executor(None, ebay.get_orders, token_state["access_token"])
+                    if orders:
+                        existing = await loop.run_in_executor(None, ha_get_ebay_items)
+                        for order in orders:
+                            await loop.run_in_executor(None, ha_upsert_ebay_item, order, existing)
+                            number = order.get("tracking_number")
+                            carrier_raw = (order.get("carrier") or "").strip().upper()
+                            canonical = EBAY_CARRIER_ALIASES.get(carrier_raw)
+                            if number and canonical == "Royal Mail / Parcelforce":
+                                await loop.run_in_executor(None, ha_ensure_royal_mail_placeholder, number)
+                            elif number and canonical in LIVE_TRACKING_SERVICES:
+                                await loop.run_in_executor(None, ha_add_live_tracking, canonical, number)
+        except Exception:  # noqa: BLE001
+            log.exception("eBay poll loop error")
+        await asyncio.sleep(EBAY_POLL_SECONDS)
 
 
 def process_matches(parsed: dict) -> int:
@@ -697,7 +908,8 @@ async def main() -> None:
     await site.start()
     log.info("HTTP trigger endpoint listening on :8099 (POST /scan {\"days_back\": N})")
 
-    tasks = [asyncio.create_task(royal_mail_poll_loop())]
+    ebay_ensure_tokens()
+    tasks = [asyncio.create_task(royal_mail_poll_loop()), asyncio.create_task(ebay_poll_loop())]
     if IDLE_ENABLED:
         tasks.append(asyncio.create_task(idle_watch_loop()))
     else:
