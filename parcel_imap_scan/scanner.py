@@ -40,6 +40,7 @@ import requests
 from aiohttp import web
 
 from extract import extract_tracking
+from amazon_orders import extract_order_status
 
 OPTIONS_PATH = Path("/data/options.json")
 
@@ -122,10 +123,15 @@ def _html_to_text(html: str) -> str:
     return f"{text}\n{hrefs}"
 
 
-def _extract_body(msg: Message) -> str:
+def _extract_body(msg: Message) -> tuple[str, str]:
+    """Return (body_text, raw_html). raw_html is the first text/html part's
+    untouched markup (empty string if the message has none) -- kept
+    alongside the existing flattened body_text so amazon_orders.py can match
+    hrefs by surrounding tag context without re-parsing the message."""
     if msg.is_multipart():
         plain_parts: list[str] = []
         html_parts: list[str] = []
+        raw_html = ""
         for part in msg.walk():
             if part.get_filename():
                 continue
@@ -142,14 +148,16 @@ def _extract_body(msg: Message) -> str:
                 plain_parts.append(decoded)
             else:
                 html_parts.append(_html_to_text(decoded))
-        return "\n".join(plain_parts + html_parts)
+                if not raw_html:
+                    raw_html = decoded
+        return "\n".join(plain_parts + html_parts), raw_html
     payload = msg.get_payload(decode=True)
     if not payload:
-        return ""
+        return "", ""
     decoded = payload.decode(msg.get_content_charset() or "utf-8", errors="replace")
     if msg.get_content_type() == "text/html":
-        return _html_to_text(decoded)
-    return decoded
+        return _html_to_text(decoded), decoded
+    return decoded, ""
 
 
 def _parse_message(raw: bytes) -> dict:
@@ -157,10 +165,10 @@ def _parse_message(raw: bytes) -> dict:
     subject = _decode_header_value(msg.get("Subject"))
     sender = _decode_header_value(msg.get("From"))
     try:
-        body = _extract_body(msg)
+        body, raw_html = _extract_body(msg)
     except Exception:  # noqa: BLE001
-        body = ""
-    return {"subject": subject, "sender": sender, "body": body}
+        body, raw_html = "", ""
+    return {"subject": subject, "sender": sender, "body": body, "raw_html": raw_html}
 
 
 # ---------------------------------------------------------------------------
@@ -223,6 +231,121 @@ def process_matches(parsed: dict) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Amazon order-status upsert (ported logic, see amazon_orders.py)
+#
+# Unlike carrier tracking numbers (one add, never updated again), an Amazon
+# order's status changes over its lifetime (Ordered -> Shipped -> Out for
+# delivery -> Delivered), each stage its own email with the same order ID.
+# So this keys off the order ID and updates the existing todo item's
+# summary/description in place rather than adding a new item each time.
+# ---------------------------------------------------------------------------
+
+AMAZON_PREFIX = "Amazon: "
+
+
+def ha_get_amazon_items() -> dict[str, dict]:
+    """Return {order_id: {"uid": ..., "status": ...}} for existing Amazon todo items."""
+    try:
+        resp = requests.post(
+            f"{HA_URL}/api/services/todo/get_items?return_response",
+            headers=HA_HEADERS,
+            json={"entity_id": TODO_ENTITY, "status": "needs_action"},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        service_response = data.get("service_response", data) if isinstance(data, dict) else {}
+        items = service_response.get(TODO_ENTITY, {}).get("items", [])
+    except Exception:  # noqa: BLE001
+        log.exception("Failed to fetch existing todo items for Amazon upsert")
+        return {}
+    result: dict[str, dict] = {}
+    for item in items:
+        summary = item.get("summary", "")
+        if not summary.startswith(AMAZON_PREFIX):
+            continue
+        rest = summary[len(AMAZON_PREFIX):]
+        order_id = rest.split(" ", 1)[0]
+        result[order_id] = {"uid": item.get("uid"), "summary": summary}
+    return result
+
+
+def ha_add_amazon_item(info: dict) -> None:
+    summary = f"{AMAZON_PREFIX}{info['order_id']} — {info['status']}"
+    description_parts = [f"Subject: {info['subject']}"]
+    if info.get("tracking_url"):
+        description_parts.append(f"Track: {info['tracking_url']}")
+    description_parts.append("Found by Parcel IMAP Scan add-on (Amazon order parser)")
+    try:
+        resp = requests.post(
+            f"{HA_URL}/api/services/todo/add_item",
+            headers=HA_HEADERS,
+            json={
+                "entity_id": TODO_ENTITY,
+                "item": summary,
+                "description": " | ".join(description_parts),
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        log.info("Added Amazon order %s: %s", info["order_id"], info["status"])
+    except Exception:  # noqa: BLE001
+        log.exception("Failed to add Amazon todo item for order %s", info["order_id"])
+
+
+def ha_update_amazon_item(uid: str, info: dict) -> None:
+    summary = f"{AMAZON_PREFIX}{info['order_id']} — {info['status']}"
+    description_parts = [f"Subject: {info['subject']}"]
+    if info.get("tracking_url"):
+        description_parts.append(f"Track: {info['tracking_url']}")
+    description_parts.append("Found by Parcel IMAP Scan add-on (Amazon order parser)")
+    try:
+        resp = requests.post(
+            f"{HA_URL}/api/services/todo/update_item",
+            headers=HA_HEADERS,
+            json={
+                "entity_id": TODO_ENTITY,
+                "item": uid,
+                "rename": summary,
+                "description": " | ".join(description_parts),
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        log.info("Updated Amazon order %s -> %s", info["order_id"], info["status"])
+    except Exception:  # noqa: BLE001
+        log.exception("Failed to update Amazon todo item for order %s", info["order_id"])
+
+
+_AMAZON_STATUS_ORDER = ["Ordered", "Shipped", "Out for delivery", "Delivered"]
+
+
+def process_amazon(parsed: dict) -> int:
+    """Extract Amazon order status from one parsed message and upsert it.
+
+    Returns 1 if a new item was added or an existing one's status advanced,
+    else 0 (nothing Amazon-related found, or status email arrived out of
+    order / is a re-send of a status we've already recorded or passed).
+    """
+    info = extract_order_status(parsed["subject"], parsed["sender"], parsed.get("raw_html", ""))
+    if not info:
+        return 0
+    existing = ha_get_amazon_items()
+    current = existing.get(info["order_id"])
+    if current is None:
+        ha_add_amazon_item(info)
+        return 1
+    current_status = current["summary"].rsplit("—", 1)[-1].strip()
+    try:
+        if _AMAZON_STATUS_ORDER.index(info["status"]) <= _AMAZON_STATUS_ORDER.index(current_status):
+            return 0  # not a forward move (duplicate/out-of-order email); leave as-is
+    except ValueError:
+        pass  # unrecognised current status text; update anyway
+    ha_update_amazon_item(current["uid"], info)
+    return 1
+
+
+# ---------------------------------------------------------------------------
 # On-demand backfill scan (blocking, run in an executor thread)
 # ---------------------------------------------------------------------------
 
@@ -269,6 +392,7 @@ def run_backfill_scan(days_back: int) -> dict:
                 found += len(matches)
                 if matches:
                     added += process_matches(parsed)
+                added += process_amazon(parsed)
             processed += len(chunk)
             log.info("Backfill scan: %d/%d messages processed (found %d, added %d so far)",
                       processed, total, found, added)
@@ -316,6 +440,7 @@ async def _fetch_and_process_new(client: "aioimaplib.IMAP4_SSL", last_uid: int) 
             continue
         parsed = _parse_message(raw)
         added = await loop.run_in_executor(None, process_matches, parsed)
+        added += await loop.run_in_executor(None, process_amazon, parsed)
         if added:
             log.info(
                 "IDLE: new mail from %s matched and added %d item(s)",
