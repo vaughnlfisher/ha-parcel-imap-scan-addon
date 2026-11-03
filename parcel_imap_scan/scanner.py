@@ -214,6 +214,30 @@ def ha_add_item(carrier: str, number: str, sender: str, subject: str) -> None:
         log.exception("Failed to add todo item for %s: %s", carrier, number)
 
 
+# AliExpress/Cainiao numbers additionally get handed to the "AliExpress
+# Package Tracker" integration (yohaybn/HA_aliexpress_package_tracker_sensor,
+# already installed) so they get live Cainiao Global status, not just a
+# static todo.parcels line -- that integration never auto-discovers orders
+# itself, it only tracks whatever numbers its own add_tracking service is
+# given, and nothing was feeding it one before this.
+ALIEXPRESS_CARRIER = "AliExpress / Cainiao"
+
+
+def ha_add_aliexpress_tracking(number: str, subject: str) -> None:
+    title = (subject or "Package").strip()[:80] or "Package"
+    try:
+        resp = requests.post(
+            f"{HA_URL}/api/services/aliexpress_package_tracker/add_tracking",
+            headers=HA_HEADERS,
+            json={"tracking_number": number, "title": title},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        log.info("Handed %s to AliExpress Package Tracker (title=%r)", number, title)
+    except Exception:  # noqa: BLE001
+        log.exception("Failed to call aliexpress_package_tracker.add_tracking for %s", number)
+
+
 def process_matches(parsed: dict) -> int:
     """Extract tracking numbers from one parsed message and add any new ones."""
     matches = extract_tracking(parsed["subject"], parsed["sender"], parsed["body"])
@@ -225,6 +249,8 @@ def process_matches(parsed: dict) -> int:
         if number in existing:
             continue
         ha_add_item(carrier, number, parsed["sender"], parsed["subject"])
+        if carrier == ALIEXPRESS_CARRIER:
+            ha_add_aliexpress_tracking(number, parsed["subject"])
         existing += f" {number}"
         added += 1
     return added
