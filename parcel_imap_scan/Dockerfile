@@ -5,7 +5,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY extract.py scanner.py run.sh ./
+COPY extract.py amazon_orders.py scanner.py run.sh ./
 RUN chmod a+x run.sh
 
 EXPOSE 8099
