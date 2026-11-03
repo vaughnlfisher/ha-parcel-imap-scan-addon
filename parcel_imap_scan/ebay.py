@@ -71,7 +71,13 @@ def _token_request(app_id: str, cert_id: str, data: dict) -> dict | None:
     }
     try:
         resp = requests.post(TOKEN_URL, headers=headers, data=data, timeout=20)
-        resp.raise_for_status()
+        if not resp.ok:
+            log.error(
+                "eBay OAuth token request failed: HTTP %s body=%s",
+                resp.status_code,
+                resp.text,
+            )
+            return None
         return resp.json()
     except Exception:  # noqa: BLE001
         log.exception("eBay OAuth token request failed")
