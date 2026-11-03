@@ -238,6 +238,37 @@ def ha_add_aliexpress_tracking(number: str, subject: str) -> None:
         log.exception("Failed to call aliexpress_package_tracker.add_tracking for %s", number)
 
 
+# UPS/Evri/FedEx matches get handed to their own ha-parcel-integrations
+# carrier integration (each installed via HACS, zero/low-touch -- UPS and
+# Evri need no account at all, FedEx uses Vaughn's own FedEx developer API
+# key already configured on that integration) so they get real live status
+# via ha-parcel-aggregator, not just a static todo.parcels line. Same
+# pattern as the pre-existing AliExpress wiring above, generalised since
+# all three expose the same <domain>.track_parcel service shape.
+LIVE_TRACKING_SERVICES: dict[str, str] = {
+    "UPS": "ups",
+    "Evri / Hermes": "evri",
+    "FedEx": "fedex",
+}
+
+
+def ha_add_live_tracking(carrier: str, number: str) -> None:
+    domain = LIVE_TRACKING_SERVICES.get(carrier)
+    if not domain:
+        return
+    try:
+        resp = requests.post(
+            f"{HA_URL}/api/services/{domain}/track_parcel",
+            headers=HA_HEADERS,
+            json={"tracking_code": number},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        log.info("Handed %s %s to %s.track_parcel for live status", carrier, number, domain)
+    except Exception:  # noqa: BLE001
+        log.exception("Failed to call %s.track_parcel for %s", domain, number)
+
+
 def process_matches(parsed: dict) -> int:
     """Extract tracking numbers from one parsed message and add any new ones."""
     matches = extract_tracking(parsed["subject"], parsed["sender"], parsed["body"])
@@ -251,6 +282,7 @@ def process_matches(parsed: dict) -> int:
         ha_add_item(carrier, number, parsed["sender"], parsed["subject"])
         if carrier == ALIEXPRESS_CARRIER:
             ha_add_aliexpress_tracking(number, parsed["subject"])
+        ha_add_live_tracking(carrier, number)
         existing += f" {number}"
         added += 1
     return added
