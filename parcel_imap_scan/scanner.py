@@ -41,6 +41,7 @@ from aiohttp import web
 
 from extract import extract_tracking
 from amazon_orders import extract_order_status
+from royal_mail import get_summary as rm_get_summary
 
 OPTIONS_PATH = Path("/data/options.json")
 
@@ -81,6 +82,9 @@ if not HA_TOKEN:
 TODO_ENTITY = OPTIONS.get("todo_entity", "todo.parcels")
 DAYS_BACK_DEFAULT = int(OPTIONS.get("days_back_default", 90))
 IDLE_ENABLED = bool(OPTIONS.get("idle_enabled", True))
+ROYAL_MAIL_CLIENT_ID = OPTIONS.get("royal_mail_client_id", "")
+ROYAL_MAIL_CLIENT_SECRET = OPTIONS.get("royal_mail_client_secret", "")
+ROYAL_MAIL_POLL_SECONDS = 1800  # 30 min; Royal Mail scans aren't second-by-second anyway
 
 HA_HEADERS = {
     "Authorization": f"Bearer {HA_TOKEN}",
@@ -267,6 +271,101 @@ def ha_add_live_tracking(carrier: str, number: str) -> None:
         log.info("Handed %s %s to %s.track_parcel for live status", carrier, number, domain)
     except Exception:  # noqa: BLE001
         log.exception("Failed to call %s.track_parcel for %s", domain, number)
+
+
+
+# ---------------------------------------------------------------------------
+# Royal Mail / Parcelforce live status (polling, since Royal Mail has no
+# HA integration/service to hand off to the way UPS/Evri/FedEx do -- this
+# add-on owns the whole lifecycle: fetch the Tracking API's summary for
+# each open Royal Mail todo.parcels item and upsert its status in place.
+# ---------------------------------------------------------------------------
+
+ROYAL_MAIL_CARRIER = "Royal Mail / Parcelforce"
+_RM_STATUS_TEXT = {
+    "IN TRANSIT": "In transit",
+    "DELIVERED": "Delivered",
+    "ISSUE": "Issue reported",
+}
+
+
+def ha_get_royal_mail_items() -> list[dict]:
+    try:
+        resp = requests.post(
+            f"{HA_URL}/api/services/todo/get_items?return_response",
+            headers=HA_HEADERS,
+            json={"entity_id": TODO_ENTITY, "status": "needs_action"},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        service_response = data.get("service_response", data) if isinstance(data, dict) else {}
+        items = service_response.get(TODO_ENTITY, {}).get("items", [])
+    except Exception:  # noqa: BLE001
+        log.exception("Failed to fetch todo items for Royal Mail poll")
+        return []
+    prefix = f"{ROYAL_MAIL_CARRIER}: "
+    result: list[dict] = []
+    for item in items:
+        summary = item.get("summary", "")
+        if not summary.startswith(prefix):
+            continue
+        number = summary[len(prefix):].split(" ", 1)[0].strip()
+        result.append({"uid": item.get("uid"), "number": number})
+    return result
+
+
+def ha_update_royal_mail_item(item: dict, info: dict) -> None:
+    status_category = (info.get("statusCategory") or "").upper()
+    status_text = _RM_STATUS_TEXT.get(
+        status_category, info.get("statusDescription") or status_category or "Unknown"
+    )
+    payload = {
+        "entity_id": TODO_ENTITY,
+        "item": item["uid"],
+        "rename": f"{ROYAL_MAIL_CARRIER}: {item['number']} — {status_text}",
+        "description": info.get("summaryLine") or info.get("statusDescription") or "",
+    }
+    if status_category == "DELIVERED":
+        payload["status"] = "completed"
+    try:
+        resp = requests.post(
+            f"{HA_URL}/api/services/todo/update_item",
+            headers=HA_HEADERS,
+            json=payload,
+            timeout=15,
+        )
+        resp.raise_for_status()
+        log.info("Royal Mail %s -> %s", item["number"], status_text)
+    except Exception:  # noqa: BLE001
+        log.exception("Failed to update Royal Mail todo item for %s", item["number"])
+
+
+async def royal_mail_poll_loop() -> None:
+    if not (ROYAL_MAIL_CLIENT_ID and ROYAL_MAIL_CLIENT_SECRET):
+        log.info("royal_mail_client_id/secret not set; Royal Mail live polling disabled")
+        while True:
+            await asyncio.sleep(3600)
+    loop = asyncio.get_event_loop()
+    while True:
+        try:
+            items = await loop.run_in_executor(None, ha_get_royal_mail_items)
+            for item in items:
+                if not item["number"]:
+                    continue
+                info = await loop.run_in_executor(
+                    None, rm_get_summary, ROYAL_MAIL_CLIENT_ID, ROYAL_MAIL_CLIENT_SECRET, item["number"]
+                )
+                if info:
+                    await loop.run_in_executor(None, ha_update_royal_mail_item, item, info)
+        except Exception:  # noqa: BLE001
+            log.exception("Royal Mail poll loop error")
+        await asyncio.sleep(ROYAL_MAIL_POLL_SECONDS)
+
+
+async def _sleep_forever() -> None:
+    while True:
+        await asyncio.sleep(3600)
 
 
 def process_matches(parsed: dict) -> int:
@@ -598,12 +697,13 @@ async def main() -> None:
     await site.start()
     log.info("HTTP trigger endpoint listening on :8099 (POST /scan {\"days_back\": N})")
 
+    tasks = [asyncio.create_task(royal_mail_poll_loop())]
     if IDLE_ENABLED:
-        await idle_watch_loop()
+        tasks.append(asyncio.create_task(idle_watch_loop()))
     else:
         log.info("idle_enabled is false; running in on-demand-only mode")
-        while True:
-            await asyncio.sleep(3600)
+        tasks.append(asyncio.create_task(_sleep_forever()))
+    await asyncio.gather(*tasks)
 
 
 if __name__ == "__main__":
