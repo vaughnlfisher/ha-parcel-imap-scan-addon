@@ -534,7 +534,7 @@ def run_backfill_scan(days_back: int) -> dict:
         # scan could take hours; batching cuts round-trips by ~100x.
         for start in range(0, total, FETCH_CHUNK_SIZE):
             chunk = uids[start : start + FETCH_CHUNK_SIZE]
-            status, msg_data = conn.fetch(",".join(chunk), "(RFC822)")
+            status, msg_data = conn.fetch(",".join(chunk), "(BODY.PEEK[])")
             if status != "OK" or not msg_data:
                 processed += len(chunk)
                 continue
@@ -585,7 +585,7 @@ async def _fetch_and_process_new(client: "aioimaplib.IMAP4_SSL", last_uid: int) 
     uids = sorted({int(u) for u in res.lines[0].split() if int(u) > last_uid})
     loop = asyncio.get_event_loop()
     for uid in uids:
-        fres = await client.uid("fetch", str(uid), "(RFC822)")
+        fres = await client.uid("fetch", str(uid), "(BODY.PEEK[])")
         if fres.result != "OK":
             continue
         raw = None
