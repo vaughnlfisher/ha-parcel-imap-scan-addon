@@ -307,17 +307,31 @@ def ha_add_live_tracking(carrier: str, number: str) -> None:
     domain = LIVE_TRACKING_SERVICES.get(carrier)
     if not domain:
         return
-    try:
-        resp = requests.post(
-            f"{HA_URL}/api/services/{domain}/track_parcel",
-            headers=HA_HEADERS,
-            json={"tracking_code": number},
-            timeout=15,
-        )
-        resp.raise_for_status()
-        log.info("Handed %s %s to %s.track_parcel for live status", carrier, number, domain)
-    except Exception:  # noqa: BLE001
-        log.exception("Failed to call %s.track_parcel for %s", domain, number)
+    # The Supervisor's proxy to Core occasionally 502s on this call (seen
+    # repeatedly for evri.track_parcel -- a transient gateway error, not a
+    # rejection from the integration itself: calling the same service
+    # directly against Core succeeds immediately). Retry a couple of times
+    # with a short backoff before giving up, since previously every 502
+    # here was silently swallowed and the carrier's parcel just never got
+    # tracked -- which is why its dashboard entry fell back to a generic
+    # "Tracking found" placeholder instead of real status.
+    last_exc: Exception | None = None
+    for attempt in range(3):
+        try:
+            resp = requests.post(
+                f"{HA_URL}/api/services/{domain}/track_parcel",
+                headers=HA_HEADERS,
+                json={"tracking_code": number},
+                timeout=25,
+            )
+            resp.raise_for_status()
+            log.info("Handed %s %s to %s.track_parcel for live status", carrier, number, domain)
+            return
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            if attempt < 2:
+                time.sleep(2 * (attempt + 1))
+    log.error("Failed to call %s.track_parcel for %s after retries: %s", domain, number, last_exc)
 
 
 
@@ -1038,8 +1052,18 @@ def build_dashboard_summary() -> dict:
             carrier, rest = summary.split(": ", 1)
             if " — " in rest:
                 identifier, item_status = rest.split(" — ", 1)
+            elif status == "completed":
+                identifier, item_status = rest, "Delivered"
+            elif carrier == ROYAL_MAIL_CARRIER:
+                # royal_mail_poll_loop only rewrites the summary with a real
+                # status once the Tracking API answers -- while Royal Mail's
+                # 401 (no active subscription on their side) blocks that,
+                # say so plainly instead of a vague generic placeholder.
+                identifier, item_status = rest, "Awaiting Royal Mail API access"
+            elif carrier == "eBay":
+                identifier, item_status = rest, "Order placed, not yet shipped"
             else:
-                identifier, item_status = rest, ("Delivered" if status == "completed" else "Tracking found")
+                identifier, item_status = rest, "Awaiting first carrier update"
             bucket.append(
                 {
                     "carrier": carrier,
