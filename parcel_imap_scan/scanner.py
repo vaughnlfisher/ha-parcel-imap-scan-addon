@@ -911,6 +911,187 @@ async def handle_health(request: web.Request) -> web.Response:
     return web.json_response({"status": "ok"})
 
 
+# ---------------------------------------------------------------------------
+# Dashboard summary sensor (sensor.parcel_tracker_summary)
+#
+# Neither todo.parcels nor this add-on's own state exposes its items as a
+# template-readable attribute (confirmed: state_attr('todo.parcels', 'items')
+# returns None). So a Lovelace card can't pull "what's delivered this week /
+# what's upcoming" together from templates alone. This merges every source
+# we know about -- the rich `parcels` list attribute already published by
+# the UPS/Evri/FedEx/Amazon carrier sensors, plus todo.parcels itself for
+# everything else (Royal Mail, eBay, general email matches) -- into one
+# sensor's attributes every few minutes, for a dashboard card to render.
+# ---------------------------------------------------------------------------
+
+SUMMARY_SENSOR = "sensor.parcel_tracker_summary"
+SUMMARY_INTERVAL_SECONDS = 300  # 5 min
+
+CARRIER_SENSOR_PREFIXES = {
+    "UPS": "sensor.ups",
+    "Evri / Hermes": "sensor.evri_rg5_3ae",
+    "FedEx": "sensor.fedex",
+    "Amazon": "sensor.amazon_amazon_co_uk_vaughn",
+}
+
+
+def _ha_get_state(entity_id: str) -> dict | None:
+    try:
+        resp = requests.get(f"{HA_URL}/api/states/{entity_id}", headers=HA_HEADERS, timeout=15)
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        return resp.json()
+    except Exception:  # noqa: BLE001
+        log.exception("Failed to fetch state for %s", entity_id)
+        return None
+
+
+def _carrier_sensor_parcels(carrier: str, suffix: str) -> list[dict]:
+    prefix = CARRIER_SENSOR_PREFIXES.get(carrier)
+    if not prefix:
+        return []
+    state = _ha_get_state(f"{prefix}_{suffix}")
+    if not state:
+        return []
+    parcels = state.get("attributes", {}).get("parcels")
+    return parcels or []
+
+
+def _within_days(iso_ts: str | None, days: int) -> bool:
+    if not iso_ts:
+        return False
+    try:
+        from datetime import timezone as _tz
+        ts = datetime.fromisoformat(iso_ts.replace("Z", "+00:00"))
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=_tz.utc)
+        return (datetime.now(_tz.utc) - ts).days < days
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _title_from_raw(raw: dict) -> str | None:
+    if not isinstance(raw, dict):
+        return None
+    items = raw.get("items")
+    if isinstance(items, list) and items:
+        return items[0]
+    return None
+
+
+def build_dashboard_summary() -> dict:
+    delivered: list[dict] = []
+    upcoming: list[dict] = []
+
+    for carrier in CARRIER_SENSOR_PREFIXES:
+        for raw in _carrier_sensor_parcels(carrier, "delivered_parcels"):
+            if not _within_days(raw.get("delivered_at"), 7):
+                continue
+            delivered.append(
+                {
+                    "carrier": carrier,
+                    "identifier": raw.get("barcode") or "",
+                    "title": _title_from_raw(raw.get("raw")) or raw.get("barcode") or carrier,
+                    "status": "Delivered",
+                    "delivered_at": raw.get("delivered_at"),
+                    "url": raw.get("url"),
+                }
+            )
+        for suffix in ("incoming_parcels", "awaiting_pickup", "en_route_to_pickup_point"):
+            for raw in _carrier_sensor_parcels(carrier, suffix):
+                upcoming.append(
+                    {
+                        "carrier": carrier,
+                        "identifier": raw.get("barcode") or "",
+                        "title": _title_from_raw(raw.get("raw")) or raw.get("barcode") or carrier,
+                        "status": raw.get("raw_status") or suffix.replace("_", " ").title(),
+                        "url": raw.get("url"),
+                    }
+                )
+
+    # todo.parcels covers Royal Mail / eBay / general email-matched parcels.
+    # Amazon lines are skipped here -- the ha-amazon sensor above already
+    # covers Amazon live with real timestamps; the old email-parsed Amazon
+    # entries are legacy and would just duplicate/clutter this view.
+    for status, bucket in (("needs_action", upcoming), ("completed", delivered)):
+        try:
+            resp = requests.post(
+                f"{HA_URL}/api/services/todo/get_items?return_response",
+                headers=HA_HEADERS,
+                json={"entity_id": TODO_ENTITY, "status": status},
+                timeout=15,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            service_response = data.get("service_response", data) if isinstance(data, dict) else {}
+            items = service_response.get(TODO_ENTITY, {}).get("items", [])
+        except Exception:  # noqa: BLE001
+            log.exception("Failed to fetch todo.parcels (%s) for dashboard summary", status)
+            items = []
+        for item in items:
+            summary = item.get("summary", "")
+            if summary.startswith(AMAZON_PREFIX):
+                continue
+            if ": " not in summary:
+                continue
+            carrier, rest = summary.split(": ", 1)
+            if " — " in rest:
+                identifier, item_status = rest.split(" — ", 1)
+            else:
+                identifier, item_status = rest, ("Delivered" if status == "completed" else "Tracking found")
+            bucket.append(
+                {
+                    "carrier": carrier,
+                    "identifier": identifier,
+                    "title": identifier,
+                    "status": item_status,
+                    "url": None,
+                }
+            )
+
+    delivered.sort(key=lambda p: p.get("delivered_at") or "", reverse=True)
+    return {"delivered_7d": delivered, "upcoming": upcoming}
+
+
+def publish_dashboard_summary() -> None:
+    summary = build_dashboard_summary()
+    try:
+        resp = requests.post(
+            f"{HA_URL}/api/states/{SUMMARY_SENSOR}",
+            headers=HA_HEADERS,
+            json={
+                "state": len(summary["upcoming"]),
+                "attributes": {
+                    "friendly_name": "Parcel Tracker Summary",
+                    "icon": "mdi:package-variant-closed",
+                    "unit_of_measurement": "parcels",
+                    "delivered_7d": summary["delivered_7d"],
+                    "upcoming": summary["upcoming"],
+                },
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        log.info(
+            "Published dashboard summary: %d delivered (7d), %d upcoming",
+            len(summary["delivered_7d"]),
+            len(summary["upcoming"]),
+        )
+    except Exception:  # noqa: BLE001
+        log.exception("Failed to publish dashboard summary sensor")
+
+
+async def dashboard_summary_loop() -> None:
+    loop = asyncio.get_event_loop()
+    while True:
+        try:
+            await loop.run_in_executor(None, publish_dashboard_summary)
+        except Exception:  # noqa: BLE001
+            log.exception("Dashboard summary loop error")
+        await asyncio.sleep(SUMMARY_INTERVAL_SECONDS)
+
+
 async def main() -> None:
     app = web.Application()
     app.add_routes(
@@ -927,7 +1108,11 @@ async def main() -> None:
     log.info("HTTP trigger endpoint listening on :8099 (POST /scan {\"days_back\": N})")
 
     ebay_ensure_tokens()
-    tasks = [asyncio.create_task(royal_mail_poll_loop()), asyncio.create_task(ebay_poll_loop())]
+    tasks = [
+        asyncio.create_task(royal_mail_poll_loop()),
+        asyncio.create_task(ebay_poll_loop()),
+        asyncio.create_task(dashboard_summary_loop()),
+    ]
     if IDLE_ENABLED:
         tasks.append(asyncio.create_task(idle_watch_loop()))
     else:
