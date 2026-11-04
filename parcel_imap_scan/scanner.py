@@ -994,19 +994,34 @@ def _title_from_raw(raw: dict) -> str | None:
     return None
 
 
+def _friendly_carrier_status(raw: dict, suffix: str) -> str:
+    # `status` is the carrier integration's own human-readable string
+    # ("registered", "in_transit", "delivered", ...); `raw_status` is an
+    # internal carrier stage code (Evri uses bare digits like "1") and is
+    # not something to show on a dashboard. Fall back to the bucket name
+    # only when the integration hasn't classified the parcel yet.
+    status = raw.get("status")
+    if status and status not in ("unknown", "none"):
+        return str(status).replace("_", " ").title()
+    return suffix.replace("_", " ").title()
+
+
 def build_dashboard_summary() -> dict:
     delivered: list[dict] = []
     upcoming: list[dict] = []
+    seen_identifiers: set[str] = set()
 
     for carrier in CARRIER_SENSOR_PREFIXES:
         for raw in _carrier_sensor_parcels(carrier, "delivered_parcels"):
             if not _within_days(raw.get("delivered_at"), 7):
                 continue
+            barcode = raw.get("barcode") or ""
+            seen_identifiers.add(barcode)
             delivered.append(
                 {
                     "carrier": carrier,
-                    "identifier": raw.get("barcode") or "",
-                    "title": _title_from_raw(raw.get("raw")) or raw.get("barcode") or carrier,
+                    "identifier": barcode,
+                    "title": _title_from_raw(raw.get("raw")) or barcode or carrier,
                     "status": "Delivered",
                     "delivered_at": raw.get("delivered_at"),
                     "url": raw.get("url"),
@@ -1014,12 +1029,14 @@ def build_dashboard_summary() -> dict:
             )
         for suffix in ("incoming_parcels", "awaiting_pickup", "en_route_to_pickup_point"):
             for raw in _carrier_sensor_parcels(carrier, suffix):
+                barcode = raw.get("barcode") or ""
+                seen_identifiers.add(barcode)
                 upcoming.append(
                     {
                         "carrier": carrier,
-                        "identifier": raw.get("barcode") or "",
-                        "title": _title_from_raw(raw.get("raw")) or raw.get("barcode") or carrier,
-                        "status": raw.get("raw_status") or suffix.replace("_", " ").title(),
+                        "identifier": barcode,
+                        "title": _title_from_raw(raw.get("raw")) or barcode or carrier,
+                        "status": _friendly_carrier_status(raw, suffix),
                         "url": raw.get("url"),
                     }
                 )
@@ -1027,7 +1044,10 @@ def build_dashboard_summary() -> dict:
     # todo.parcels covers Royal Mail / eBay / general email-matched parcels.
     # Amazon lines are skipped here -- the ha-amazon sensor above already
     # covers Amazon live with real timestamps; the old email-parsed Amazon
-    # entries are legacy and would just duplicate/clutter this view.
+    # entries are legacy and would just duplicate/clutter this view. Any
+    # identifier already surfaced above (now that UPS/Evri/FedEx hand real
+    # status back) is skipped too, so a parcel the carrier sensor already
+    # covers doesn't also show up a second time via the generic fallback.
     for status, bucket in (("needs_action", upcoming), ("completed", delivered)):
         try:
             resp = requests.post(
@@ -1064,6 +1084,8 @@ def build_dashboard_summary() -> dict:
                 identifier, item_status = rest, "Order placed, not yet shipped"
             else:
                 identifier, item_status = rest, "Awaiting first carrier update"
+            if identifier in seen_identifiers:
+                continue
             bucket.append(
                 {
                     "carrier": carrier,

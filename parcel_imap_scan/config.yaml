@@ -1,5 +1,5 @@
 name: "Parcel IMAP Scan"
-version: "1.4.1"
+version: "1.4.2"
 slug: "parcel_imap_scan"
 description: "Watches a mailbox (live IMAP IDLE + on-demand backfill) for parcel tracking numbers and reports them into Home Assistant via the REST API."
 url: "https://github.com/vaughnlfisher/ha-parcel-imap-scan-addon"
